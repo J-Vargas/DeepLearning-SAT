@@ -1,0 +1,271 @@
+'''
+Group : Yamile Vargas, David Ng Wu, Nika Tsankashvili
+High Performance Machine Learning
+'''
+
+import os
+import time
+import numpy as np
+import scipy.io
+import tensorflow as tf
+from layers import conv_layer, max_pool_2x2, full_layer, conv_layer_no_relu, avg_pool_2x2
+
+DATA_PATH = ''.join([os.getcwd(), '/', 'sat-6-full.mat'])
+
+# HYPERS
+NUM_SAMPLES = 324000
+NUM_TEST_SAMPLES = 8100
+EPOCHS = 13
+BATCH_SIZE = 128
+STEPS = int((NUM_SAMPLES * EPOCHS) / BATCH_SIZE)
+ONE_EPOCH = int(NUM_SAMPLES / BATCH_SIZE)
+TEST_INTERVAL = BATCH_SIZE * 5
+MODELS_TO_KEEP = 5
+lr = 0.0001
+decay = 0.9
+momentum = 0
+dropoutProb = 0.5
+
+LABELS = os.path.join(os.getcwd(), "metadata-sat6.tsv")  # Label path for visualization
+SPRITES = os.path.join(os.getcwd(), "sprite-sat6.png")
+
+version = 'DNJ-NET-sat6'
+output_dir = 'results-for-' + str(EPOCHS) + 'e' + str(BATCH_SIZE) + 'bs-' + version
+log_dir = os.path.join(output_dir, 'logs')
+log_name = 'lr' + str(lr) + 'd' + str(decay) + 'm' + str(momentum) + 'do' + str(dropoutProb)
+output_file = 'output.txt'
+model_dir = os.path.join(output_dir, 'trained_models')
+model_name = 'model.ckpt'
+
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+write_to_file = open(os.path.join(output_dir, output_file), 'w')
+write_to_file.write('HYPER_PARAMETERS_USED')
+write_to_file.write('\n---------------------')
+write_to_file.write('\nNUM_SAMPLES:' + str(NUM_SAMPLES))
+write_to_file.write('\nEPOCHS:' + str(EPOCHS))
+write_to_file.write('\nBATCH_SIZE:' + str(BATCH_SIZE))
+write_to_file.write('\nSTEPS:' + str(STEPS))
+write_to_file.write('\nLEARNING_RATE:' + str(lr))
+write_to_file.write('\nDECAY:' + str(decay))
+write_to_file.write('\nMOMENTUM:' + str(momentum))
+write_to_file.write('\nDROPOUT:' + str(dropoutProb))
+
+
+class DeepSatLoader:
+    def __init__(self, key):
+        self._key = key
+        self._i = 0
+        self.images = None
+        self.labels = None
+
+    def load_data(self):
+        data = scipy.io.loadmat(DATA_PATH)
+        self.images = data[self._key + '_x'].transpose(3, 0, 1, 2).astype(float) / 255
+        self.labels = data[self._key + '_y'].transpose(1, 0)
+        return self
+
+    def next_batch(self, batch_size):
+        x = self.images[self._i:self._i+batch_size]
+        y = self.labels[self._i:self._i+batch_size]
+        self._i = (self._i + batch_size) % len(self.images)
+        return x, y
+
+
+class DeepSatData:
+    def __init__(self):
+        self.train = DeepSatLoader('train').load_data()
+        self.test  = DeepSatLoader('test').load_data()
+
+
+def batch_norm(x, n_out, phase_train):
+    """
+    Batch normalization on convolutional maps.
+    Ref.: http://stackoverflow.com/questions/33949786/how-could-i-use-batch-normalization-in-tensorflow
+    Args:
+        x:           Tensor, 4D BHWD input maps
+        n_out:       integer, depth of input maps
+        phase_train: boolean tf.Varialbe, true indicates training phase
+        scope:       string, variable scope
+    Return:
+        normed:      batch-normalized maps
+    """
+
+    beta = tf.Variable(tf.constant(0.0, shape=[n_out]), name='beta', trainable=True)
+    gamma = tf.Variable(tf.constant(1.0, shape=[n_out]), name='gamma', trainable=True)
+    batch_mean, batch_var = tf.nn.moments(x, [0,1,2], name='moments')
+    ema = tf.train.ExponentialMovingAverage(decay=0.5)
+
+    def mean_var_with_update():
+        ema_apply_op = ema.apply([batch_mean, batch_var])
+        with tf.control_dependencies([ema_apply_op]):
+            return tf.identity(batch_mean), tf.identity(batch_var)
+
+    mean, var = tf.cond(phase_train, mean_var_with_update,
+                        lambda: (ema.average(batch_mean), ema.average(batch_var)))
+    normed = tf.nn.batch_normalization(x, mean, var, beta, gamma, 1e-3)
+    return normed
+
+
+def cnn_model_trainer():
+    dataset = DeepSatData()
+
+    x = tf.placeholder(tf.float32, shape=[None, 28, 28, 4], name='x')
+    y_ = tf.placeholder(tf.float32, shape=[None, 6], name='y_')
+    keep_prob = tf.placeholder(tf.float32, name='keep_prob')
+    phase_train = tf.placeholder(tf.bool, name='phase_train')
+
+    conv1 = conv_layer_no_relu(x, shape=[3, 3, 4, 16], pad='SAME')
+    conv1_bn = batch_norm(conv1, 16, phase_train)
+    conv1_rl = tf.nn.relu(conv1_bn)
+
+    conv2 = conv_layer_no_relu(conv1_rl, shape=[3, 3, 16, 32], pad='SAME')
+    conv2_bn = batch_norm(conv2, 32, phase_train)
+    conv2_rl = tf.nn.relu(conv2_bn)
+    conv2_pool = avg_pool_2x2(conv2_rl, 2, 2)
+
+    conv3 = conv_layer_no_relu(conv2_pool, shape=[3, 3, 32, 64], pad='SAME')
+    conv3_bn = batch_norm(conv3, 64, phase_train)
+    conv3_rl = tf.nn.relu(conv3_bn)
+    conv3_pool = avg_pool_2x2(conv3_rl, 2, 2)
+
+    conv4 = conv_layer_no_relu(conv3_pool, shape=[3, 3, 64, 96], pad='SAME')
+    conv4_bn = batch_norm(conv4, 96, phase_train)
+    conv4_rl = tf.nn.relu(conv4_bn)
+
+    conv5 = conv_layer_no_relu(conv4_rl, shape=[3, 3, 96, 64], pad='SAME')
+    conv5_bn = batch_norm(conv5, 64, phase_train)
+    conv5_rl = tf.nn.relu(conv5_bn)
+    conv5_pool = avg_pool_2x2(conv5_rl, 2, 2)
+
+    _flat = tf.reshape(conv5_pool, [-1, 3 * 3 * 64])
+    _drop1 = tf.nn.dropout(_flat, keep_prob=keep_prob)
+
+    full_1 = tf.nn.relu(full_layer(_drop1, 512))
+    _drop2 = tf.nn.dropout(full_1, keep_prob=keep_prob)
+
+    full_2 = tf.nn.relu(full_layer(_drop2, 256))
+
+    full_3 = full_layer(full_2, 6)
+
+    # network output as softmax tensor for prediction for presentation
+    pred = tf.nn.softmax(logits=full_3, name='pred')  # for later prediction
+
+    cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=full_3, labels=y_))
+
+    # train_step = tf.train.RMSPropOptimizer(lr, decay, momentum).minimize(cross_entropy)
+    train_step = tf.train.AdamOptimizer(lr).minimize(cross_entropy)
+
+    correct_prediction = tf.equal(tf.argmax(full_3, 1), tf.argmax(y_, 1))
+    accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32), name='accuracy')
+
+    tf.summary.scalar('loss', cross_entropy)
+    tf.summary.scalar('accuracy', accuracy)
+
+    # Setting up for the visualization of the data in Tensorboard
+    embedding_size = 256    # size of second to last fc layer
+    embedding_input = full_2    # FC2 as input
+    # Variable containing the points in visualization
+    embedding = tf.Variable(tf.zeros([NUM_TEST_SAMPLES, embedding_size]), name="test_embedding")  # NUM_TEST_SAMPLES/10 = 8100
+    assignment = embedding.assign(embedding_input)  # Will be passed in the test session
+
+    merged_sum = tf.summary.merge_all()
+
+    def test(test_sess, assign):
+        x_ = dataset.test.images.reshape(10, NUM_TEST_SAMPLES, 28, 28, 4)
+        y = dataset.test.labels.reshape(10, NUM_TEST_SAMPLES, 6)
+
+        test_acc = np.mean([test_sess.run(accuracy, feed_dict={x: x_[im], y_: y[im], keep_prob: 1.0, phase_train: False})
+                            for im in range(10)])
+
+        # Pass through the last 8100 of the test set for visualization
+        test_sess.run([assign], feed_dict={x: x_[9], y_: y[9], keep_prob: 1.0, phase_train: False})
+        return test_acc
+
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        # Tensorboard
+        sum_writer = tf.summary.FileWriter(os.path.join(log_dir, log_name))
+        sum_writer.add_graph(sess.graph)
+
+        # Create a Saver object
+        # max_to_keep: keep how many models to keep. Delete old ones.
+        saver = tf.train.Saver(max_to_keep=MODELS_TO_KEEP)
+
+        # Setting up Projector
+        config = tf.contrib.tensorboard.plugins.projector.ProjectorConfig()
+        embedding_config = config.embeddings.add()
+        embedding_config.tensor_name = embedding.name
+        embedding_config.metadata_path = LABELS     # labels
+
+        # Specify the width and height of a single thumbnail.
+        embedding_config.sprite.image_path = SPRITES
+        embedding_config.sprite.single_image_dim.extend([28, 28])
+        tf.contrib.tensorboard.plugins.projector.visualize_embeddings(sum_writer, config)
+
+        for i in range(STEPS):
+            batch = dataset.train.next_batch(BATCH_SIZE)
+            batch_x = batch[0]
+            batch_y = batch[1]
+
+            sess.run(train_step, feed_dict={x: batch_x, y_: batch_y, keep_prob: dropoutProb, phase_train: True})
+
+            _, summ = sess.run([train_step, merged_sum], feed_dict={x: batch_x, y_: batch_y, keep_prob: dropoutProb, phase_train: True})
+            sum_writer.add_summary(summ, i)
+
+            if i % ONE_EPOCH == 0:
+                ep_print = "\n*****************EPOCH: %d" % ((i/ONE_EPOCH) + 1)
+                write_to_file.write(ep_print)
+                print(ep_print)
+            if i % TEST_INTERVAL == 0:
+                acc = test(sess, assignment)
+                loss = sess.run(cross_entropy, feed_dict={x: batch_x, y_: batch_y, keep_prob: 1.0, phase_train: False})
+                ep_test_print = "\nEPOCH:%d" % ((i/ONE_EPOCH) + 1) + " Step:" + str(i) + \
+                                "|| Minibatch Loss= " + "{:.4f}".format(loss) + \
+                                " Accuracy: {:.4}%".format(acc * 100)
+                write_to_file.write(ep_test_print)
+                print(ep_test_print)
+                # Create a checkpoint in every iteration
+                saver.save(sess, os.path.join(model_dir, model_name),
+                           global_step=i)
+
+        test(sess, assignment)
+        sum_writer.close()
+
+
+def create_tsv(ds):
+    # Creates the labels for the last 10,000 pictures
+    labels = ['building', 'barren land', 'trees', 'grassland', 'road', 'water']
+    with open('metadata-sat6.tsv', 'w') as f:
+        y = ds.test.labels[-NUM_TEST_SAMPLES:]
+        for i in range(NUM_TEST_SAMPLES):  # 81000/10 = 8100. Last 8100 of test data
+            argmax = int(np.argmax(y[i]))
+            f.write("%s \n" % labels[argmax])
+
+
+def create_sprite_image(images):
+    # Creates sprite image from a given input
+    img_h = images.shape[1]  # 28
+    img_w = images.shape[2]  # 28
+    n_plots = int(np.ceil(np.sqrt(images.shape[0])))  # 100
+
+    sprite_image = np.ones((img_h * n_plots, img_w * n_plots, 3))  # (2800, 2800)
+
+    for i in range(n_plots):
+        for j in range(n_plots):
+            this_filter = i * n_plots + j
+            if this_filter < images.shape[0]:
+                this_img = images[this_filter]
+                sprite_image[i * img_h:(i + 1) * img_h, j * img_w:(j + 1) * img_w] = this_img
+
+    return sprite_image
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+    cnn_model_trainer()
+    time_stop = "\n--- %s seconds ---" % (time.time() - start_time)
+    write_to_file.write(time_stop)
+    print(time_stop)
+    write_to_file.close()
